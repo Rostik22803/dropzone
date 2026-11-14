@@ -393,7 +393,7 @@ local function updateESP()
                     local scrA, visA = Camera:WorldToViewportPoint(posA)
                     local scrB, visB = Camera:WorldToViewportPoint(posB)
 
-                    if visA or visB then
+                    if visA and visB and scrA.Z > 0.05 and scrB.Z > 0.05 then
                         local vA = Vector2.new(scrA.X, scrA.Y)
                         local vB = Vector2.new(scrB.X, scrB.Y)
 
@@ -470,7 +470,7 @@ local function updateESP()
         local topScreen, topVis = Camera:WorldToViewportPoint(topWorld)
         local botScreen, botVis = Camera:WorldToViewportPoint(botWorld)
 
-        if not topVis and not botVis then
+        if (not topVis and not botVis) or topScreen.Z <= 0.05 or botScreen.Z <= 0.05 then
             for i = 1, 8 do
                 entry.Drawings.Box[i].Visible = false
                 entry.Drawings.BoxOutline[i].Visible = false
@@ -590,7 +590,9 @@ local effects = Instance.new("Folder")
 effects.Name = "OcelEffects"
 effects.Parent = Workspace
 local cham_records = {}
+local silhouette_records = {}
 local target_part
+local fallback_aim
 local silent_status = "not connected"
 local camera_controller, original_aim_ray, wrapped_aim_ray
 local stopped = false
@@ -608,13 +610,18 @@ end
 
 local function update_chams()
     local wanted = {}
+    local silhouettes = {}
     local function collect(root, config, filter)
         if not root or not config.Enabled then return end
+        if not filter and config.Style ~= "Wire" then silhouettes[root] = config end
         for _, part in ipairs(root:GetDescendants()) do
             if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" and (not filter or filter(part)) then
                 -- Do not reveal invisible helper parts or hitboxes.
                 local old = cham_records[part]
-                if (old and old.transparency or part.Transparency) < 1 then wanted[part] = config end
+                if (old and old.transparency or part.Transparency) < 1 then
+                    wanted[part] = config
+                    if filter and config.Style ~= "Wire" then silhouettes[part] = config end
+                end
             end
         end
     end
@@ -660,25 +667,18 @@ local function update_chams()
         local color = config.Style == "Rainbow" and Color3.fromHSV((os.clock() * 0.15) % 1, 0.8, 1) or config.Color
         local transparency = config.Transparency
         if config.Style == "Pulse" then transparency = math.clamp(transparency + math.sin(os.clock() * 3) * 0.2, 0, 1) end
-        local wire = config.Style == "Wire" or config.Style == "Outline"
-        if not record.box or record.wire ~= wire then
-            if record.box then record.box:Destroy() end
-            record.box = Instance.new(wire and "SelectionBox" or "BoxHandleAdornment")
+        local wire = config.Style == "Wire"
+        if record.box and not wire then record.box:Destroy(); record.box = nil end
+        if wire and not record.box then
+            record.box = Instance.new("SelectionBox")
             record.box.Adornee = part
             record.box.Parent = effects
-            record.wire = wire
         end
         local box = record.box
-        box.Color3 = color
-        if wire then
-            box.LineThickness = config.Style == "Wire" and 0.025 or 0.06
+        if box then
+            box.Color3 = color
+            box.LineThickness = 0.025
             box.SurfaceTransparency = 1
-            box.Transparency = transparency
-            -- SelectionBox does not expose AlwaysOnTop.
-        else
-            box.Size = part.Size + Vector3.new(0.015, 0.015, 0.015)
-            box.AlwaysOnTop = config.ThroughWalls
-            box.ZIndex = 2
             box.Transparency = transparency
         end
         local material = materials[config.Style]
@@ -696,11 +696,43 @@ local function update_chams()
             record.modified = false
         end
     end
+    for adornee, highlight in pairs(silhouette_records) do
+        if not silhouettes[adornee] or not adornee.Parent then
+            highlight:Destroy()
+            silhouette_records[adornee] = nil
+        end
+    end
+    local highlight_count = 0
+    for _ in pairs(silhouette_records) do highlight_count = highlight_count + 1 end
+    for adornee, config in pairs(silhouettes) do
+        local highlight = silhouette_records[adornee]
+        if not highlight and highlight_count < 30 then
+            highlight = Instance.new("Highlight")
+            highlight.Name = "OcelSilhouette"
+            highlight.Adornee = adornee
+            highlight.Parent = effects
+            silhouette_records[adornee] = highlight
+            highlight_count = highlight_count + 1
+        end
+        if highlight then
+            local color = config.Style == "Rainbow" and Color3.fromHSV((os.clock() * 0.15) % 1, 0.8, 1) or config.Color
+            local transparency = config.Transparency
+            if config.Style == "Pulse" then transparency = math.clamp(transparency + math.sin(os.clock() * 3) * 0.2, 0, 1) end
+            highlight.FillColor = color
+            highlight.OutlineColor = color
+            highlight.FillTransparency = config.Style == "Outline" and 1 or transparency
+            highlight.OutlineTransparency = config.Style == "Outline" and transparency or 1
+            highlight.DepthMode = config.ThroughWalls and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
+        end
+    end
 end
 
 local fov_circle = createDrawing("Circle", {Filled = false, Thickness = 1, Color = Color3.new(1, 1, 1), Transparency = 0.6, Visible = false, NumSides = 64})
 local function update_aim(dt)
+    Camera = Workspace.CurrentCamera
+    local previous_target = target_part
     target_part = nil
+    fallback_aim = nil
     if not Camera then return end
     local aim = Hub.Aim
     local center = Camera.ViewportSize * 0.5
@@ -720,15 +752,29 @@ local function update_aim(dt)
             if part and part:IsA("BasePart") and (part.Position - Camera.CFrame.Position).Magnitude <= ESP_CONFIG.MaxDistance then
                 local screen, visible = Camera:WorldToViewportPoint(part.Position)
                 local distance = (Vector2.new(screen.X, screen.Y) - center).Magnitude
-                if visible and distance < best then
+                local score = part == previous_target and distance * 0.7 or distance
+                if visible and distance <= aim.FOV and score < best then
                     local hit = aim.Visible and Workspace:Raycast(Camera.CFrame.Position, part.Position - Camera.CFrame.Position, params)
-                    if not hit or hit.Instance:IsDescendantOf(model) then best = distance; target_part = part end
+                    if not hit or hit.Instance:IsDescendantOf(model) then best = score; target_part = part end
                 end
             end
         end
     end
     if target_part and aim.Enabled and not UserInputService:GetFocusedTextBox() then
-        Camera.CFrame = Camera.CFrame:Lerp(CFrame.lookAt(Camera.CFrame.Position, target_part.Position), 1 - math.exp(-aim.Smooth * dt))
+        local delta = target_part.Position - Camera.CFrame.Position
+        if delta.Magnitude < 0.001 then return end
+        local alpha = 1 - math.exp(-aim.Smooth * math.min(dt, 0.05))
+        if camera_controller and type(camera_controller.setViewAngles) == "function" and type(camera_controller.getYaw) == "function" and type(camera_controller.getPitch) == "function" then
+            -- The dump stores yaw/pitch in degrees, not radians.
+            local yaw = math.deg(math.atan2(-delta.X, -delta.Z))
+            local pitch = math.deg(math.asin(math.clamp(delta.Unit.Y, -1, 1)))
+            local current_yaw = camera_controller.getYaw()
+            local current_pitch = camera_controller.getPitch()
+            local yaw_delta = (yaw - current_yaw + 180) % 360 - 180
+            camera_controller.setViewAngles(current_yaw + yaw_delta * alpha, current_pitch + (pitch - current_pitch) * alpha)
+        else
+            fallback_aim = {Position = target_part.Position, Alpha = alpha}
+        end
     end
 end
 
@@ -776,13 +822,43 @@ local function button(parent, text, size)
     round(object, 8)
     return object
 end
-local watermark = button(gui, "OCEL / HUB   •   MENU", UDim2.fromOffset(192, 44))
+local screen = instance("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Active = false}, gui)
+local watermark = button(screen, "OCEL / HUB   •   MENU", UDim2.fromOffset(192, 44))
 watermark.Position = UDim2.fromOffset(14, 10)
-local panel = instance("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.54), Size = UDim2.fromOffset(420, 470), BackgroundColor3 = Color3.fromRGB(12, 12, 12), BorderSizePixel = 0}, gui)
+local panel = instance("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.54), Size = UDim2.fromOffset(420, 470), BackgroundColor3 = Color3.fromRGB(12, 12, 12), BorderSizePixel = 0, Active = true}, screen)
 round(panel, 14)
 instance("UIStroke", {Color = Color3.fromRGB(75, 75, 75), Thickness = 1}, panel)
 local scale = instance("UIScale", {Scale = 1}, panel)
 local title = instance("TextLabel", {Position = UDim2.fromOffset(18, 8), Size = UDim2.new(1, -36, 0, 42), BackgroundTransparency = 1, Text = "Ocel-hub", TextColor3 = Color3.new(1, 1, 1), TextSize = 23, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, panel)
+title.Active = true
+local menu_drag, menu_drag_start, menu_start_position
+local function clamp_panel()
+    local available = screen.AbsoluteSize
+    local half = panel.AbsoluteSize * 0.5
+    local position = panel.Position
+    local x = position.X.Scale * available.X + position.X.Offset
+    local y = position.Y.Scale * available.Y + position.Y.Offset
+    local min_x, min_y = half.X + 6, half.Y + 6
+    local max_x, max_y = math.max(min_x, available.X - half.X - 6), math.max(min_y, available.Y - half.Y - 6)
+    panel.Position = UDim2.fromOffset(math.clamp(x, min_x, max_x), math.clamp(y, min_y, max_y))
+end
+connect(title.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        clamp_panel()
+        menu_drag = input
+        menu_drag_start = Vector2.new(input.Position.X, input.Position.Y)
+        menu_start_position = panel.Position
+    end
+end)
+-- Keep menu touches out of the game's mobile look controller.
+connect(UserInputService.InputBegan, function(input)
+    if input.UserInputType ~= Enum.UserInputType.Touch or not camera_controller or type(camera_controller.ignoreTouch) ~= "function" then return end
+    local function inside(object)
+        local position, size = object.AbsolutePosition, object.AbsoluteSize
+        return input.Position.X >= position.X and input.Position.X <= position.X + size.X and input.Position.Y >= position.Y and input.Position.Y <= position.Y + size.Y
+    end
+    if inside(watermark) or (panel.Visible and inside(panel)) then camera_controller.ignoreTouch(input) end
+end)
 local tabs = instance("Frame", {Position = UDim2.fromOffset(14, 58), Size = UDim2.new(1, -28, 0, 42), BackgroundTransparency = 1}, panel)
 instance("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6)}, tabs)
 local content = instance("ScrollingFrame", {Position = UDim2.fromOffset(14, 112), Size = UDim2.new(1, -28, 1, -126), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = Color3.new(1, 1, 1), AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollingDirection = Enum.ScrollingDirection.Y}, panel)
@@ -874,7 +950,7 @@ show_page = function(page)
         local config = Hub[selected_chams]
         toggle("Chams", config, "Enabled")
         cycle("Style", config, "Style", styles)
-        toggle("Through walls (filled styles)", config, "ThroughWalls")
+        toggle("Through walls (silhouette)", config, "ThroughWalls")
         slider("Transparency", config, "Transparency", 0, 1, 0.01)
         color_picker(config)
     elseif page == "AIM" then
@@ -900,21 +976,34 @@ for _, name in ipairs({"ESP", "CHAMS", "AIM", "HUB"}) do
 end
 connect(watermark.Activated, function() panel.Visible = not panel.Visible end)
 connect(UserInputService.InputChanged, function(input)
+    if menu_drag and (input == menu_drag or (menu_drag.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)) then
+        local delta = Vector2.new(input.Position.X, input.Position.Y) - menu_drag_start
+        panel.Position = UDim2.fromOffset(menu_start_position.X.Offset + delta.X, menu_start_position.Y.Offset + delta.Y)
+        clamp_panel()
+    end
     if drag_update and (input == drag_input or (drag_input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)) then drag_update(input.Position.X) end
 end)
 connect(UserInputService.InputEnded, function(input)
+    if input == menu_drag then menu_drag = nil end
     if input == drag_input then drag_input, drag_update = nil, nil; content.ScrollingEnabled = true end
 end)
 local elapsed = 0
 local function update_hub(dt)
-    local viewport = Camera and Camera.ViewportSize or Vector2.new(800, 600)
+    local viewport = screen.AbsoluteSize
     scale.Scale = math.min(1, (viewport.X - 24) / 420, (viewport.Y - 90) / 470)
-    update_aim(dt)
+    clamp_panel()
     elapsed = elapsed + dt
     if elapsed >= 0.1 then elapsed = 0; update_chams() end
 end
 show_page("ESP")
-RunService:BindToRenderStep("AdvancedESP_Vanta", Enum.RenderPriority.Camera.Value + 1, function(dt)
+-- Adjust controller angles before CoreCamera (+1); project ESP only after
+-- CoreCamera, CombatViewmodel (+2), CombatWeapon (+3), and FarView (+5).
+RunService:BindToRenderStep("OcelAim", Enum.RenderPriority.Camera.Value, update_aim)
+RunService:BindToRenderStep("AdvancedESP_Vanta", Enum.RenderPriority.Last.Value, function(dt)
+    Camera = Workspace.CurrentCamera
+    if Camera and fallback_aim then
+        Camera.CFrame = Camera.CFrame:Lerp(CFrame.lookAt(Camera.CFrame.Position, fallback_aim.Position), fallback_aim.Alpha)
+    end
     updateESP()
     update_hub(dt)
 end)
@@ -923,11 +1012,14 @@ Hub.Destroy = function()
     if stopped then return end
     stopped = true
     RunService:UnbindFromRenderStep("AdvancedESP_Vanta")
+    RunService:UnbindFromRenderStep("OcelAim")
     for _, connection in ipairs(hub_connections) do connection:Disconnect() end
     if camera_controller and camera_controller.getAimRay == wrapped_aim_ray then
         pcall(function() camera_controller.getAimRay = original_aim_ray end)
     end
     for part, record in pairs(cham_records) do clear_record(part, record) end
+    for _, highlight in pairs(silhouette_records) do highlight:Destroy() end
+    table.clear(silhouette_records)
     for _, entry in pairs(Entries) do entry:Destroy() end
     table.clear(Entries)
     fov_circle:Remove()
