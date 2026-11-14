@@ -612,6 +612,7 @@ local Hub = {
     Enemy = cham_config(), Hands = cham_config(), Weapon = cham_config(), Self = cham_config(),
     Aim = {Enabled = false, Silent = false, FOV = 140, Smooth = 12, Visible = true, Part = "Head", ShowFOV = true},
     WeaponMods = {NoRecoil = false, NoSpread = false},
+    Tracer = {Enabled = false, Color = Color3.new(1, 1, 1), Lifetime = 0.6, Thickness = 1.5, Transparency = 0.15},
 }
 local styles = {"Solid", "Outline", "Neon", "Glass", "ForceField", "Metal", "Wire", "Pulse", "Rainbow"}
 local materials = {Neon = Enum.Material.Neon, Glass = Enum.Material.Glass, ForceField = Enum.Material.ForceField, Metal = Enum.Material.Metal}
@@ -622,12 +623,65 @@ local cham_records = {}
 local silhouette_records = {}
 local target_part
 local fallback_aim
-local shot_context
 local silent_status = "not connected"
 local camera_controller, original_aim_ray, wrapped_aim_ray
 local stopped = false
 local module_hooks = {}
-local mod_status = {Recoil = "not connected", Spread = "not connected", Ballistics = "not connected"}
+local mod_status = {Recoil = "not connected", Spread = "not connected", Ballistics = "native / no trajectory override", Tracer = "not connected"}
+local tracer_paths = {}
+local function remove_tracer(path)
+    for _, line in ipairs(path.lines) do line:Remove() end
+end
+local function add_tracer(origin, direction, speed, drag, ballistics, max_range)
+    if not Hub.Tracer.Enabled or typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then return end
+    if type(speed) ~= "number" or speed <= 0 or type(drag) ~= "number" then return end
+    if type(ballistics.position) ~= "function" or type(ballistics.timeFor) ~= "function" then return end
+    local duration = math.min(ballistics.timeFor(speed, drag, max_range) or (max_range / speed), 3)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local excluded = {effects}
+    if Camera then table.insert(excluded, Camera) end
+    if LocalPlayer.Character then table.insert(excluded, LocalPlayer.Character) end
+    params.FilterDescendantsInstances = excluded
+    params.IgnoreWater = true
+    local path = {points = {origin}, lines = {}, created = os.clock(), lifetime = Hub.Tracer.Lifetime}
+    for index = 1, 12 do
+        local position = ballistics.position(origin, direction.Unit, speed, drag, duration * index / 12)
+        local previous = path.points[#path.points]
+        local hit = Workspace:Raycast(previous, position - previous, params)
+        table.insert(path.points, hit and hit.Position or position)
+        table.insert(path.lines, createDrawing("Line", {Visible = false, Thickness = Hub.Tracer.Thickness, Color = Hub.Tracer.Color}))
+        if hit then break end
+    end
+    if #tracer_paths >= 8 then remove_tracer(table.remove(tracer_paths, 1)) end
+    table.insert(tracer_paths, path)
+end
+local function update_tracers()
+    for index = #tracer_paths, 1, -1 do
+        local path = tracer_paths[index]
+        local progress = (os.clock() - path.created) / path.lifetime
+        if not Hub.Tracer.Enabled or progress >= 1 then
+            remove_tracer(path)
+            table.remove(tracer_paths, index)
+        else
+            for segment, line in ipairs(path.lines) do
+                line.Visible = false
+                if Camera then
+                    local start, start_visible = Camera:WorldToViewportPoint(path.points[segment])
+                    local finish, finish_visible = Camera:WorldToViewportPoint(path.points[segment + 1])
+                    if start.Z > 0.05 and finish.Z > 0.05 and (start_visible or finish_visible) then
+                        line.From = Vector2.new(start.X, start.Y)
+                        line.To = Vector2.new(finish.X, finish.Y)
+                        line.Color = Hub.Tracer.Color
+                        line.Thickness = Hub.Tracer.Thickness
+                        line.Transparency = (1 - Hub.Tracer.Transparency) * (1 - progress)
+                        line.Visible = true
+                    end
+                end
+            end
+        end
+    end
+end
 local function wrap_method(object, key, make_wrapper)
     if stopped or type(object) ~= "table" or type(object[key]) ~= "function" then return false end
     local original = object[key]
@@ -851,11 +905,9 @@ task.spawn(function()
     original_aim_ray = controller.getAimRay
     wrapped_aim_ray = function(...)
         local origin, direction = original_aim_ray(...)
-        shot_context = nil
         if valid_silent_target(origin) then
             local delta = target_part.Position - origin
             if delta.Magnitude > 0.001 then
-                shot_context = {origin = origin, direction = delta.Unit, time = os.clock()}
                 return origin, delta.Unit
             end
         end
@@ -890,7 +942,6 @@ task.spawn(function()
     end
     mod_status.Recoil = recoil_hooks > 0 and (tostring(recoil_hooks) .. " APIs connected") or "API unavailable"
     local ballistics = load_module(combat, "Ballistics")
-    local stats = load_module(combat, "WeaponStats")
     if stopped then return end
     local spread_ok = wrap_method(ballistics, "cone", function(original)
         return function(direction, spread, random, ...)
@@ -900,36 +951,28 @@ task.spawn(function()
         end
     end)
     mod_status.Spread = spread_ok and "client cone connected" or "API unavailable"
-    local stats_ok = wrap_method(stats, "zeroAngle", function(original)
-        return function(weapon_stats, ...)
-            if shot_context then shot_context.stats = weapon_stats end
-            return original(weapon_stats, ...)
-        end
-    end)
-    local elevate_ok = wrap_method(ballistics, "elevate", function(original)
-        return function(direction, angle, ...)
-            local context = shot_context
-            if context and context.stats and os.clock() - context.time < 0.05 and direction:Dot(context.direction) > 0.8 and valid_silent_target(context.origin) and type(ballistics.intercept) == "function" and type(ballistics.aimDir) == "function" then
-                local weapon_stats = context.stats
-                if type(weapon_stats.v0) == "number" and weapon_stats.v0 > 0 and type(weapon_stats.drag) == "number" then
-                    local origin = context.origin
-                    local character = LocalPlayer.Character
-                    local arm = character and character:FindFirstChild("Right Arm")
-                    local joint = arm and arm:FindFirstChild("RootPart")
-                    local weapon_root = joint and joint:IsA("Motor6D") and joint.Part1
-                    local muzzle = weapon_root and (weapon_root:FindFirstChild("MuzzleTip") or weapon_root:FindFirstChild("Muzzle"))
-                    if muzzle and muzzle:IsA("Attachment") and (muzzle.WorldPosition - origin).Magnitude < 12 then origin = muzzle.WorldPosition end
-                    if valid_silent_target(origin) then
-                        local predicted = ballistics.intercept(origin, target_part.Position, target_part.AssemblyLinearVelocity, weapon_stats.v0, weapon_stats.drag)
-                        -- aimDir already compensates drop; do not apply zeroing twice.
-                        return ballistics.aimDir(origin, predicted, weapon_stats.v0, weapon_stats.drag)
+    local weapon_controller = load_module(client, "WeaponController")
+    local ballistics_fx = load_module(client, "BallisticsFx")
+    if stopped then return end
+    local tracer_ok = wrap_method(ballistics_fx, "tracer", function(original)
+        return function(origin, direction, speed, drag, local_shot, ...)
+            -- Keep the native tracer and its return value intact.
+            local result = original(origin, direction, speed, drag, local_shot, ...)
+            if local_shot and ballistics and Hub.Tracer.Enabled then
+                local ok, err = pcall(function()
+                    local range = ESP_CONFIG.MaxDistance
+                    if weapon_controller and type(weapon_controller.getStats) == "function" then
+                        local stats = weapon_controller.getStats()
+                        if stats and type(stats.range) == "number" then range = stats.range end
                     end
-                end
+                    add_tracer(origin, direction, speed, drag, ballistics, math.clamp(range, 1, 10000))
+                end)
+                if not ok then mod_status.Tracer = "draw failed: " .. tostring(err) end
             end
-            return original(direction, angle, ...)
+            return result
         end
     end)
-    mod_status.Ballistics = stats_ok and elevate_ok and "lead / drop connected" or "API unavailable"
+    mod_status.Tracer = tracer_ok and "actual shot direction connected" or "BallisticsFx.tracer unavailable"
 end)
 
 local gui = Instance.new("ScreenGui")
@@ -1103,6 +1146,12 @@ show_page = function(page)
         toggle("Held item", ESP_CONFIG, "ShowWeapon")
         toggle("Visible green / hidden red", ESP_CONFIG, "VisibilityColors")
         slider("Max distance", ESP_CONFIG, "MaxDistance", 100, 3000, 50)
+        toggle("Bullet tracers / local shots", Hub.Tracer, "Enabled")
+        slider("Tracer lifetime", Hub.Tracer, "Lifetime", 0.1, 3, 0.1)
+        slider("Tracer thickness", Hub.Tracer, "Thickness", 1, 4, 0.5)
+        slider("Tracer transparency", Hub.Tracer, "Transparency", 0, 1, 0.05)
+        button(content, "Tracer color / RGB")
+        color_picker(Hub.Tracer)
     elseif page == "CHAMS" then
         local selection = {Target = selected_chams}
         dropdown("Target", selection, "Target", {"Enemy", "Hands", "Weapon", "Self"}, function(value)
@@ -1129,6 +1178,7 @@ show_page = function(page)
         button(content, "Ballistics: " .. mod_status.Ballistics)
         button(content, "Recoil: " .. mod_status.Recoil)
         button(content, "Spread: " .. mod_status.Spread)
+        button(content, "Tracer: " .. mod_status.Tracer)
     else
         button(content, "Tap the watermark to hide / show")
         button(content, "Mobile • 16 enemy cham limit • 10 Hz")
@@ -1159,6 +1209,7 @@ local function update_hub(dt)
     local viewport = screen.AbsoluteSize
     scale.Scale = math.min(1, (viewport.X - 24) / 420, (viewport.Y - 90) / 470)
     clamp_panel()
+    update_tracers()
     elapsed = elapsed + dt
     if elapsed >= 0.1 then elapsed = 0; update_chams() end
 end
@@ -1186,6 +1237,8 @@ Hub.Destroy = function()
         if hook.object[hook.key] == hook.wrapper then pcall(function() hook.object[hook.key] = hook.original end) end
     end
     table.clear(module_hooks)
+    for _, path in ipairs(tracer_paths) do remove_tracer(path) end
+    table.clear(tracer_paths)
     if camera_controller and camera_controller.getAimRay == wrapped_aim_ray then
         pcall(function() camera_controller.getAimRay = original_aim_ray end)
     end
