@@ -37,6 +37,9 @@ local ESP_CONFIG = {
     HeadCircleColor = Color3.fromRGB(255, 255, 255),
     HeadCircleScale = 1.6,
     ShowWeapon = true,
+    VisibilityColors = true,
+    VisibleColor = Color3.fromRGB(70, 235, 110),
+    HiddenColor = Color3.fromRGB(245, 65, 65),
 
     -- Health Bar
     HealthBar = true,
@@ -48,6 +51,29 @@ local ESP_CONFIG = {
 }
 
 local Entries = {}
+local visibility_cache = setmetatable({}, {__mode = "k"})
+local function target_visible(model)
+    local camera = Workspace.CurrentCamera
+    if not camera then return false end
+    local cached = visibility_cache[model]
+    if cached and os.clock() - cached.time < 0.1 and (camera.CFrame.Position - cached.origin).Magnitude < 2 then return cached.visible end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local excluded = {camera}
+    if LocalPlayer.Character then table.insert(excluded, LocalPlayer.Character) end
+    params.FilterDescendantsInstances = excluded
+    params.IgnoreWater = true
+    local visible = false
+    for _, name in ipairs({"Head", "UpperTorso", "Torso", "HumanoidRootPart"}) do
+        local part = model:FindFirstChild(name)
+        if part and part:IsA("BasePart") then
+            local hit = Workspace:Raycast(camera.CFrame.Position, part.Position - camera.CFrame.Position, params)
+            if not hit or hit.Instance:IsDescendantOf(model) then visible = true; break end
+        end
+    end
+    visibility_cache[model] = {time = os.clock(), origin = camera.CFrame.Position, visible = visible}
+    return visible
+end
 
 local function createDrawing(drawType, props)
     local obj = Drawing.new(drawType)
@@ -376,12 +402,13 @@ local function updateESP()
 
         local isR15 = hum.RigType == Enum.HumanoidRigType.R15 or model:FindFirstChild("UpperTorso") ~= nil
         local jointPoints = getJointPoints(model, isR15)
+        local visibility_color = ESP_CONFIG.VisibilityColors and (target_visible(model) and ESP_CONFIG.VisibleColor or ESP_CONFIG.HiddenColor) or nil
 
         -------------------------------------------------------------
         -- 1. DETAILED SKELETON WITH OUTLINES & JOINTS
         -------------------------------------------------------------
         if ESP_CONFIG.SkeletonEnabled and jointPoints then
-            local skelCol = teammate and ESP_CONFIG.SkeletonTeamColor or ESP_CONFIG.SkeletonColor
+            local skelCol = visibility_color or (teammate and ESP_CONFIG.SkeletonTeamColor or ESP_CONFIG.SkeletonColor)
 
             for idx, pair in ipairs(SKELETON_PAIRS) do
                 local posA = jointPoints[pair[1]]
@@ -442,7 +469,7 @@ local function updateESP()
 
                     hc.Position = center
                     hc.Radius = headRadius
-                    hc.Color = ESP_CONFIG.HeadCircleColor
+                    hc.Color = visibility_color or ESP_CONFIG.HeadCircleColor
                     hc.Visible = true
                 else
                     entry.Drawings.HeadCircle.Visible = false
@@ -485,7 +512,7 @@ local function updateESP()
         local boxWidth = boxHeight * 0.55
         local boxX = math.floor(rootScreen.X - boxWidth * 0.5)
         local boxY = math.floor(topScreen.Y)
-        local boxCol = teammate and ESP_CONFIG.BoxTeamColor or ESP_CONFIG.BoxColor
+        local boxCol = visibility_color or (teammate and ESP_CONFIG.BoxTeamColor or ESP_CONFIG.BoxColor)
 
         if ESP_CONFIG.BoxEnabled then
             local cornerLen = math.clamp(math.floor(boxWidth * ESP_CONFIG.CornerRatio), 5, 24)
@@ -553,6 +580,7 @@ local function updateESP()
         -------------------------------------------------------------
         if ESP_CONFIG.ShowInfo then
             local info = entry.Drawings.InfoText
+            info.Color = visibility_color or Color3.new(1, 1, 1)
             local displayName = model:GetAttribute("DisplayName") or model.Name
             local stateTag = model:GetAttribute("Knocked") and " [KNOCKED]" or ""
             info.Text = string.format("%s%s [%dm]", displayName, stateTag, math.floor(dist))
@@ -583,6 +611,7 @@ end
 local Hub = {
     Enemy = cham_config(), Hands = cham_config(), Weapon = cham_config(), Self = cham_config(),
     Aim = {Enabled = false, Silent = false, FOV = 140, Smooth = 12, Visible = true, Part = "Head", ShowFOV = true},
+    WeaponMods = {NoRecoil = false, NoSpread = false},
 }
 local styles = {"Solid", "Outline", "Neon", "Glass", "ForceField", "Metal", "Wire", "Pulse", "Rainbow"}
 local materials = {Neon = Enum.Material.Neon, Glass = Enum.Material.Glass, ForceField = Enum.Material.ForceField, Metal = Enum.Material.Metal}
@@ -593,9 +622,39 @@ local cham_records = {}
 local silhouette_records = {}
 local target_part
 local fallback_aim
+local shot_context
 local silent_status = "not connected"
 local camera_controller, original_aim_ray, wrapped_aim_ray
 local stopped = false
+local module_hooks = {}
+local mod_status = {Recoil = "not connected", Spread = "not connected", Ballistics = "not connected"}
+local function wrap_method(object, key, make_wrapper)
+    if stopped or type(object) ~= "table" or type(object[key]) ~= "function" then return false end
+    local original = object[key]
+    local wrapper = make_wrapper(original)
+    local ok = pcall(function() object[key] = wrapper end)
+    if ok then table.insert(module_hooks, {object = object, key = key, original = original, wrapper = wrapper}) end
+    return ok
+end
+local function valid_silent_target(origin)
+    local part = target_part
+    if not Camera or not Hub.Aim.Silent or not part or not part.Parent or typeof(origin) ~= "Vector3" then return false end
+    local model = part:FindFirstAncestorOfClass("Model")
+    local humanoid = model and model:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 or isTeammate(model) or model:GetAttribute("Eliminated") or model:GetAttribute("Knocked") then return false end
+    local screen, on_screen = Camera:WorldToViewportPoint(part.Position)
+    if not on_screen or (Vector2.new(screen.X, screen.Y) - Camera.ViewportSize * 0.5).Magnitude > Hub.Aim.FOV then return false end
+    if Hub.Aim.Visible then
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local excluded = {Camera, effects}
+        if LocalPlayer.Character then table.insert(excluded, LocalPlayer.Character) end
+        params.FilterDescendantsInstances = excluded
+        local hit = Workspace:Raycast(origin, part.Position - origin, params)
+        if hit and not hit.Instance:IsDescendantOf(model) then return false end
+    end
+    return (part.Position - origin).Magnitude <= ESP_CONFIG.MaxDistance
+end
 
 local function clear_record(part, record)
     if record.box then record.box:Destroy() end
@@ -792,14 +851,85 @@ task.spawn(function()
     original_aim_ray = controller.getAimRay
     wrapped_aim_ray = function(...)
         local origin, direction = original_aim_ray(...)
-        if Hub.Aim.Silent and target_part and target_part.Parent and typeof(origin) == "Vector3" then
+        shot_context = nil
+        if valid_silent_target(origin) then
             local delta = target_part.Position - origin
-            if delta.Magnitude > 0.001 then return origin, delta.Unit end
+            if delta.Magnitude > 0.001 then
+                shot_context = {origin = origin, direction = delta.Unit, time = os.clock()}
+                return origin, delta.Unit
+            end
         end
         return origin, direction
     end
     local assigned = pcall(function() controller.getAimRay = wrapped_aim_ray end)
     silent_status = assigned and "connected" or "controller is read-only"
+end)
+
+task.spawn(function()
+    local replicated = game:GetService("ReplicatedStorage")
+    local client = replicated:FindFirstChild("Client")
+    local shared = replicated:FindFirstChild("Shared")
+    local combat = shared and shared:FindFirstChild("Combat")
+    local function load_module(root, name)
+        local module = root and root:FindFirstChild(name, true)
+        if not module or not module:IsA("ModuleScript") then return nil end
+        local ok, object = pcall(require, module)
+        if ok and not stopped and type(object) == "table" then return object end
+    end
+    local recoil_hooks = 0
+    for _, name in ipairs({"CameraController", "ViewmodelController"}) do
+        local object = load_module(client, name)
+        for _, method in ipairs(name == "CameraController" and {"addRecoil", "kick"} or {"kick"}) do
+            if wrap_method(object, method, function(original)
+                return function(...)
+                    if Hub.WeaponMods.NoRecoil then return end
+                    return original(...)
+                end
+            end) then recoil_hooks = recoil_hooks + 1 end
+        end
+    end
+    mod_status.Recoil = recoil_hooks > 0 and (tostring(recoil_hooks) .. " APIs connected") or "API unavailable"
+    local ballistics = load_module(combat, "Ballistics")
+    local stats = load_module(combat, "WeaponStats")
+    if stopped then return end
+    local spread_ok = wrap_method(ballistics, "cone", function(original)
+        return function(direction, spread, random, ...)
+            -- Advance the original RNG even when suppressing the client cone.
+            local result = original(direction, spread, random, ...)
+            return Hub.WeaponMods.NoSpread and direction or result
+        end
+    end)
+    mod_status.Spread = spread_ok and "client cone connected" or "API unavailable"
+    local stats_ok = wrap_method(stats, "zeroAngle", function(original)
+        return function(weapon_stats, ...)
+            if shot_context then shot_context.stats = weapon_stats end
+            return original(weapon_stats, ...)
+        end
+    end)
+    local elevate_ok = wrap_method(ballistics, "elevate", function(original)
+        return function(direction, angle, ...)
+            local context = shot_context
+            if context and context.stats and os.clock() - context.time < 0.05 and direction:Dot(context.direction) > 0.8 and valid_silent_target(context.origin) and type(ballistics.intercept) == "function" and type(ballistics.aimDir) == "function" then
+                local weapon_stats = context.stats
+                if type(weapon_stats.v0) == "number" and weapon_stats.v0 > 0 and type(weapon_stats.drag) == "number" then
+                    local origin = context.origin
+                    local character = LocalPlayer.Character
+                    local arm = character and character:FindFirstChild("Right Arm")
+                    local joint = arm and arm:FindFirstChild("RootPart")
+                    local weapon_root = joint and joint:IsA("Motor6D") and joint.Part1
+                    local muzzle = weapon_root and (weapon_root:FindFirstChild("MuzzleTip") or weapon_root:FindFirstChild("Muzzle"))
+                    if muzzle and muzzle:IsA("Attachment") and (muzzle.WorldPosition - origin).Magnitude < 12 then origin = muzzle.WorldPosition end
+                    if valid_silent_target(origin) then
+                        local predicted = ballistics.intercept(origin, target_part.Position, target_part.AssemblyLinearVelocity, weapon_stats.v0, weapon_stats.drag)
+                        -- aimDir already compensates drop; do not apply zeroing twice.
+                        return ballistics.aimDir(origin, predicted, weapon_stats.v0, weapon_stats.drag)
+                    end
+                end
+            end
+            return original(direction, angle, ...)
+        end
+    end)
+    mod_status.Ballistics = stats_ok and elevate_ok and "lead / drop connected" or "API unavailable"
 end)
 
 local gui = Instance.new("ScreenGui")
@@ -885,6 +1015,38 @@ local function cycle(label, config, key, choices)
         control.Text = label .. "   /   " .. tostring(config[key])
     end)
 end
+local function dropdown(label, config, key, choices, on_changed)
+    local holder = instance("Frame", {Size = UDim2.new(1, 0, 0, 44), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1}, content)
+    instance("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, holder)
+    local control = button(holder, label .. "   /   " .. tostring(config[key]) .. "   v")
+    control.LayoutOrder = 0
+    local options = instance("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = Color3.fromRGB(18, 18, 18), Visible = false, LayoutOrder = 1, BorderSizePixel = 0}, holder)
+    round(options, 8)
+    instance("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder}, options)
+    local items = {}
+    local function refresh()
+        control.Text = label .. "   /   " .. tostring(config[key]) .. (options.Visible and "   ^" or "   v")
+        for value, item in pairs(items) do
+            local selected = config[key] == value
+            item.Text = (selected and "[x]  " or "[ ]  ") .. tostring(value)
+            item.BackgroundColor3 = selected and Color3.fromRGB(225, 225, 225) or Color3.fromRGB(29, 29, 29)
+            item.TextColor3 = selected and Color3.new(0, 0, 0) or Color3.new(1, 1, 1)
+        end
+    end
+    for index, value in ipairs(choices) do
+        local item = button(options, tostring(value))
+        item.LayoutOrder = index
+        items[value] = item
+        item.Activated:Connect(function()
+            config[key] = value
+            options.Visible = false
+            refresh()
+            if on_changed then on_changed(value) end
+        end)
+    end
+    control.Activated:Connect(function() options.Visible = not options.Visible; refresh() end)
+    refresh()
+end
 local function slider(label, config, key, minimum, maximum, step)
     local row = instance("Frame", {Size = UDim2.new(1, 0, 0, 64), BackgroundColor3 = Color3.fromRGB(24, 24, 24), BorderSizePixel = 0}, content)
     round(row, 8)
@@ -939,29 +1101,34 @@ show_page = function(page)
         toggle("Health", ESP_CONFIG, "HealthBar")
         toggle("Names / distance", ESP_CONFIG, "ShowInfo")
         toggle("Held item", ESP_CONFIG, "ShowWeapon")
+        toggle("Visible green / hidden red", ESP_CONFIG, "VisibilityColors")
         slider("Max distance", ESP_CONFIG, "MaxDistance", 100, 3000, 50)
     elseif page == "CHAMS" then
-        local choose = button(content, "Target   /   " .. selected_chams)
-        choose.Activated:Connect(function()
-            local choices = {"Enemy", "Hands", "Weapon", "Self"}
-            selected_chams = choices[(table.find(choices, selected_chams) % #choices) + 1]
+        local selection = {Target = selected_chams}
+        dropdown("Target", selection, "Target", {"Enemy", "Hands", "Weapon", "Self"}, function(value)
+            selected_chams = value
             show_page(page)
         end)
         local config = Hub[selected_chams]
         toggle("Chams", config, "Enabled")
-        cycle("Style", config, "Style", styles)
+        dropdown("Style", config, "Style", styles)
         toggle("Through walls (silhouette)", config, "ThroughWalls")
         slider("Transparency", config, "Transparency", 0, 1, 0.01)
         color_picker(config)
     elseif page == "AIM" then
         toggle("Aim / camera", Hub.Aim, "Enabled")
         toggle("Silent aim / aim ray", Hub.Aim, "Silent")
+        toggle("No recoil", Hub.WeaponMods, "NoRecoil")
+        toggle("No spread / client cone", Hub.WeaponMods, "NoSpread")
         toggle("Visibility check", Hub.Aim, "Visible")
         toggle("Show FOV", Hub.Aim, "ShowFOV")
         cycle("Target part", Hub.Aim, "Part", {"Head", "HumanoidRootPart"})
         slider("FOV radius", Hub.Aim, "FOV", 30, 400, 5)
         slider("Aim speed", Hub.Aim, "Smooth", 1, 30, 1)
         button(content, "Silent API: " .. silent_status)
+        button(content, "Ballistics: " .. mod_status.Ballistics)
+        button(content, "Recoil: " .. mod_status.Recoil)
+        button(content, "Spread: " .. mod_status.Spread)
     else
         button(content, "Tap the watermark to hide / show")
         button(content, "Mobile • 16 enemy cham limit • 10 Hz")
@@ -1014,6 +1181,11 @@ Hub.Destroy = function()
     RunService:UnbindFromRenderStep("AdvancedESP_Vanta")
     RunService:UnbindFromRenderStep("OcelAim")
     for _, connection in ipairs(hub_connections) do connection:Disconnect() end
+    for index = #module_hooks, 1, -1 do
+        local hook = module_hooks[index]
+        if hook.object[hook.key] == hook.wrapper then pcall(function() hook.object[hook.key] = hook.original end) end
+    end
+    table.clear(module_hooks)
     if camera_controller and camera_controller.getAimRay == wrapped_aim_ray then
         pcall(function() camera_controller.getAimRay = original_aim_ray end)
     end
